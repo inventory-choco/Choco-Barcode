@@ -278,6 +278,9 @@ export default function Home() {
                   <th className="px-5 py-3">Barcode</th>
                   <th className="hidden px-5 py-3 sm:table-cell">Item code</th>
                   <th className="px-5 py-3 text-right">Weight kg</th>
+                  <th className="w-16 px-3 py-3">
+                    <span className="sr-only">Actions</span>
+                  </th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-[#eee3da]">
@@ -298,11 +301,28 @@ export default function Home() {
                     <td className="px-5 py-3 text-right font-mono font-black">
                       {scan.weight.toFixed(3)}
                     </td>
+                    <td className="px-3 py-2 text-right">
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setScans((items) =>
+                            items.filter((_, itemIndex) => itemIndex !== index),
+                          );
+                          setMessage(`Deleted barcode ${scan.barcode}`);
+                          setMessageType('ready');
+                        }}
+                        className="inline-grid h-8 w-8 place-items-center rounded-lg text-[#a4482f] transition hover:bg-[#f7ddd4] focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-[#a4482f]"
+                        aria-label={`Delete barcode ${scan.barcode}`}
+                        title="Delete this barcode"
+                      >
+                        <Trash2 size={15} />
+                      </button>
+                    </td>
                   </tr>
                 ))}
                 {!scans.length && (
                   <tr>
-                    <td colSpan={4} className="px-5 py-24 text-center">
+                    <td colSpan={5} className="px-5 py-24 text-center">
                       <Barcode
                         className="mx-auto mb-4 text-[#ceb8aa]"
                         size={42}
