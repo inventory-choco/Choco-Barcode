@@ -34,10 +34,37 @@ export default function Home() {
   const [messageType, setMessageType] = useState<'ready' | 'success' | 'error'>(
     'ready',
   );
-  const [copied, setCopied] = useState(false);
+  const [autoEnter, setAutoEnter] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const saved = localStorage.getItem('choco_auto_enter');
+      if (saved !== null) return saved === 'true';
+    }
+    return true;
+  });
+  const [copiedTotal, setCopiedTotal] = useState(false);
+  const [copiedAverage, setCopiedAverage] = useState(false);
+
   const scannerBuffer = useRef('');
   const scannerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastKeyTimeRef = useRef<number>(0);
+  const isRapidScanRef = useRef<boolean>(false);
+  const autoEnterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    try {
+      localStorage.setItem('choco_auto_enter', String(autoEnter));
+    } catch {
+      // Ignore localStorage errors in private windows
+    }
+  }, [autoEnter]);
+
+  useEffect(() => {
+    return () => {
+      if (autoEnterTimerRef.current) clearTimeout(autoEnterTimerRef.current);
+      if (scannerTimer.current) clearTimeout(scannerTimer.current);
+    };
+  }, []);
 
   const addBarcode = useCallback((raw: string) => {
     const parsed = parseBarcode(raw);
@@ -58,6 +85,7 @@ export default function Home() {
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       const target = event.target as HTMLElement;
       if (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA') return;
+
       if (event.key === 'Enter') {
         if (scannerBuffer.current) {
           event.preventDefault();
@@ -67,41 +95,154 @@ export default function Home() {
       } else if (/^\d$/.test(event.key)) {
         scannerBuffer.current += event.key;
         if (scannerTimer.current) clearTimeout(scannerTimer.current);
+
+        // If autoEnter is enabled and buffer reaches 13 digits, auto enter immediately
+        if (autoEnter && scannerBuffer.current.length === 13) {
+          const parsed = parseBarcode(scannerBuffer.current);
+          if (parsed) {
+            addBarcode(scannerBuffer.current);
+            scannerBuffer.current = '';
+            return;
+          }
+        }
+
+        // Debounce timer for scanners without an Enter key
         scannerTimer.current = setTimeout(() => {
+          if (autoEnter && scannerBuffer.current) {
+            addBarcode(scannerBuffer.current);
+          }
           scannerBuffer.current = '';
-        }, 250);
+        }, 220);
       }
     };
     window.addEventListener('keydown', onKeyDown);
-    return () => window.removeEventListener('keydown', onKeyDown);
-  }, [mode, addBarcode]);
+    return () => {
+      window.removeEventListener('keydown', onKeyDown);
+      if (scannerTimer.current) clearTimeout(scannerTimer.current);
+    };
+  }, [mode, addBarcode, autoEnter]);
 
   const total = useMemo(
     () => scans.reduce((sum, scan) => sum + scan.weight, 0),
     [scans],
   );
   const average = scans.length ? total / scans.length : 0;
-  const submitInput = () => {
-    const values = input.split(/\s+/).filter(Boolean);
+
+  const submitInput = (valueToSubmit?: string) => {
+    const text = valueToSubmit !== undefined ? valueToSubmit : input;
+    const values = text.split(/\s+/).filter(Boolean);
     let added = 0;
     values.forEach((value) => {
       if (addBarcode(value)) added += 1;
     });
-    if (added) setInput('');
+    if (added > 0) {
+      setInput('');
+    } else if (values.length > 0) {
+      inputRef.current?.select();
+    }
     inputRef.current?.focus();
   };
+
+  const handleInputKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    const now = Date.now();
+    const diff = now - lastKeyTimeRef.current;
+    lastKeyTimeRef.current = now;
+
+    // Fast keystroke sequence (< 80ms) indicates a hardware barcode scanner
+    if (diff < 80) {
+      isRapidScanRef.current = true;
+    } else if (diff > 250) {
+      isRapidScanRef.current = false;
+    }
+  };
+
+  const handleInputChange = (val: string) => {
+    setInput(val);
+
+    if (autoEnterTimerRef.current) {
+      clearTimeout(autoEnterTimerRef.current);
+      autoEnterTimerRef.current = null;
+    }
+
+    if (!autoEnter) return;
+
+    const trimmed = val.trim();
+
+    // 1. If input forms a complete valid 13-digit barcode, auto enter immediately
+    if (parseBarcode(trimmed)) {
+      addBarcode(trimmed);
+      setInput('');
+      isRapidScanRef.current = false;
+      return;
+    }
+
+    // 2. If entered rapidly by a scanner without Enter key, auto-submit on scan end
+    if (isRapidScanRef.current && trimmed.length > 0) {
+      autoEnterTimerRef.current = setTimeout(() => {
+        if (inputRef.current) {
+          const currentVal = inputRef.current.value.trim();
+          if (currentVal) {
+            submitInput(currentVal);
+          }
+        }
+        isRapidScanRef.current = false;
+      }, 200);
+    }
+  };
+
   const clearAll = () => {
     setScans([]);
     setInput('');
+    if (autoEnterTimerRef.current) {
+      clearTimeout(autoEnterTimerRef.current);
+      autoEnterTimerRef.current = null;
+    }
+    isRapidScanRef.current = false;
     setMessage('Cleared — ready for a new batch');
     setMessageType('ready');
     inputRef.current?.focus();
   };
-  const copyAverage = async () => {
-    await navigator.clipboard.writeText(average.toFixed(3));
-    setCopied(true);
-    setTimeout(() => setCopied(false), 1500);
+
+  const copyToClipboard = async (text: string) => {
+    try {
+      if (navigator.clipboard?.writeText) {
+        await navigator.clipboard.writeText(text);
+        return true;
+      }
+    } catch {
+      // Fallback below
+    }
+    try {
+      const textarea = document.createElement('textarea');
+      textarea.value = text;
+      textarea.style.position = 'fixed';
+      textarea.style.opacity = '0';
+      document.body.appendChild(textarea);
+      textarea.select();
+      const success = document.execCommand('copy');
+      document.body.removeChild(textarea);
+      return success;
+    } catch {
+      return false;
+    }
   };
+
+  const copyTotal = async () => {
+    const ok = await copyToClipboard(total.toFixed(3));
+    if (ok !== false) {
+      setCopiedTotal(true);
+      setTimeout(() => setCopiedTotal(false), 1500);
+    }
+  };
+
+  const copyAverage = async () => {
+    const ok = await copyToClipboard(average.toFixed(3));
+    if (ok !== false) {
+      setCopiedAverage(true);
+      setTimeout(() => setCopiedAverage(false), 1500);
+    }
+  };
+
   const exportCsv = () => {
     const rows = [
       'SR,BARCODE,ITEM CODE,WEIGHT KG',
@@ -217,7 +358,7 @@ export default function Home() {
             <Barcode className="text-[#a4482f]" /> 2-Barcode
           </div>
           <span className="hidden rounded-full bg-[#e7f4e7] px-3 py-1.5 text-xs font-bold text-[#357044] sm:inline">
-            ● Scanner active
+            ● Scanner active {autoEnter ? '· Auto-enter on' : ''}
           </span>
         </div>
       </header>
@@ -230,17 +371,30 @@ export default function Home() {
                   Scan barcodes
                 </h1>
                 <p className="mt-1 text-sm text-[#80675d]">
-                  Scan anywhere on this page, or paste one or many barcodes
-                  below.
+                  Scan anywhere on this page, or enter / paste barcodes below.
                 </p>
               </div>
-              <button
-                disabled={!scans.length}
-                onClick={() => setScans((items) => items.slice(0, -1))}
-                className="inline-flex items-center gap-2 rounded-xl border border-[#dfd1c5] px-4 py-2 text-sm font-bold disabled:opacity-35"
-              >
-                <Undo2 size={16} /> Undo last
-              </button>
+              <div className="flex flex-wrap items-center gap-2.5">
+                <label
+                  className="inline-flex cursor-pointer select-none items-center gap-2 rounded-xl border border-[#dfd1c5] bg-[#fffdf9] px-3.5 py-2 text-xs font-bold text-[#5a2417] shadow-sm transition hover:bg-[#f5ede6]"
+                  title="Automatically add barcodes after scanning without pressing Enter"
+                >
+                  <input
+                    type="checkbox"
+                    checked={autoEnter}
+                    onChange={(e) => setAutoEnter(e.target.checked)}
+                    className="h-4 w-4 rounded border-[#cfb9a9] accent-[#5a2417]"
+                  />
+                  <span>Auto-enter</span>
+                </label>
+                <button
+                  disabled={!scans.length}
+                  onClick={() => setScans((items) => items.slice(0, -1))}
+                  className="inline-flex items-center gap-2 rounded-xl border border-[#dfd1c5] px-4 py-2 text-sm font-bold disabled:opacity-35"
+                >
+                  <Undo2 size={16} /> Undo last
+                </button>
+              </div>
             </div>
             <form
               onSubmit={(e) => {
@@ -252,14 +406,18 @@ export default function Home() {
               <input
                 ref={inputRef}
                 value={input}
-                onChange={(e) => setInput(e.target.value)}
-                placeholder="Scan or paste barcode(s)…"
+                onChange={(e) => handleInputChange(e.target.value)}
+                onKeyDown={handleInputKeyDown}
+                placeholder="Scan or enter barcode(s)…"
                 inputMode="numeric"
                 autoFocus
                 className="min-w-0 flex-1 rounded-xl border border-[#cfb9a9] bg-white px-4 py-3 font-mono text-base outline-none ring-[#d98d64] focus:ring-3"
                 aria-label="Barcode input"
               />
-              <button className="rounded-xl bg-[#5a2417] px-5 font-bold text-white hover:bg-[#6c2a1b]">
+              <button
+                type="submit"
+                className="rounded-xl bg-[#5a2417] px-5 font-bold text-white transition hover:bg-[#6c2a1b] active:scale-95"
+              >
                 Add
               </button>
             </form>
@@ -345,22 +503,35 @@ export default function Home() {
             <p className="text-xs font-bold uppercase tracking-[.16em] text-[#dcae99]">
               Batch summary
             </p>
-            <div className="mt-6 grid grid-cols-2 gap-4">
-              <div>
-                <p className="text-xs text-[#d9bbaa]">Barcodes</p>
-                <p className="mt-1 text-3xl font-black">{scans.length}</p>
-              </div>
-              <div>
-                <p className="text-xs text-[#d9bbaa]">Total weight</p>
-                <p className="mt-1 text-3xl font-black">
-                  {total.toFixed(3)}
-                  <span className="ml-1 text-sm font-semibold text-[#d9bbaa]">
-                    kg
-                  </span>
-                </p>
+            <div className="mt-5">
+              <p className="text-xs text-[#d9bbaa]">Barcodes</p>
+              <p className="mt-1 text-3xl font-black">{scans.length}</p>
+            </div>
+            <div className="mt-5 border-t border-white/15 pt-5">
+              <div className="flex items-end justify-between gap-3">
+                <div>
+                  <p className="text-xs text-[#d9bbaa]">Total weight</p>
+                  <p className="mt-1 text-3xl font-black">
+                    {total.toFixed(3)}
+                    <span className="ml-1 text-sm font-semibold text-[#d9bbaa]">
+                      kg
+                    </span>
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={!scans.length}
+                  onClick={copyTotal}
+                  className="inline-flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-sm font-black text-[#34170f] transition hover:bg-[#f5ede6] active:scale-95 disabled:opacity-40"
+                  aria-label="Copy total weight"
+                  title="Copy total weight in kg"
+                >
+                  {copiedTotal ? <Check size={16} /> : <Clipboard size={16} />}{' '}
+                  {copiedTotal ? 'Copied' : 'Copy'}
+                </button>
               </div>
             </div>
-            <div className="mt-6 border-t border-white/15 pt-5">
+            <div className="mt-5 border-t border-white/15 pt-5">
               <div className="flex items-end justify-between gap-3">
                 <div>
                   <p className="text-xs text-[#d9bbaa]">Average weight</p>
@@ -372,12 +543,19 @@ export default function Home() {
                   </p>
                 </div>
                 <button
+                  type="button"
                   disabled={!scans.length}
                   onClick={copyAverage}
-                  className="inline-flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-sm font-black text-[#34170f] disabled:opacity-40"
+                  className="inline-flex items-center gap-2 rounded-xl bg-white px-3 py-2 text-sm font-black text-[#34170f] transition hover:bg-[#f5ede6] active:scale-95 disabled:opacity-40"
+                  aria-label="Copy average weight"
+                  title="Copy average weight in kg"
                 >
-                  {copied ? <Check size={16} /> : <Clipboard size={16} />}{' '}
-                  {copied ? 'Copied' : 'Copy'}
+                  {copiedAverage ? (
+                    <Check size={16} />
+                  ) : (
+                    <Clipboard size={16} />
+                  )}{' '}
+                  {copiedAverage ? 'Copied' : 'Copy'}
                 </button>
               </div>
             </div>
