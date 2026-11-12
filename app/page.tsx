@@ -142,6 +142,10 @@ export default function Home() {
     () => scans.reduce((sum, scan) => sum + scan.weight, 0),
     [scans],
   );
+  const scannedBarcodes = useMemo(
+    () => new Set(scans.map((scan) => scan.barcode)),
+    [scans],
+  );
   const average = scans.length ? total / scans.length : 0;
 
   const submitInput = (valueToSubmit?: string) => {
@@ -624,6 +628,7 @@ export default function Home() {
         onScan={addBarcode}
         onUndo={undoLast}
         isValidBarcode={isValidBarcode}
+        scannedBarcodes={scannedBarcodes}
         scanCount={scans.length}
         totalWeight={total}
         lastMessage={message}
