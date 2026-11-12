@@ -4,6 +4,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   ArrowLeft,
   Barcode,
+  Camera,
   Check,
   Clipboard,
   Download,
@@ -12,6 +13,7 @@ import {
   Trash2,
   Undo2,
 } from 'lucide-react';
+import { CameraScannerModal, unlockScanAudio } from '../src/camera-scanner';
 
 type Scan = { barcode: string; weight: number; itemCode: string };
 type Mode = 'home' | '2' | '3' | '4';
@@ -43,6 +45,7 @@ export default function Home() {
   });
   const [copiedTotal, setCopiedTotal] = useState(false);
   const [copiedAverage, setCopiedAverage] = useState(false);
+  const [cameraOpen, setCameraOpen] = useState(false);
 
   const scannerBuffer = useRef('');
   const scannerTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -79,8 +82,21 @@ export default function Home() {
     return true;
   }, []);
 
+  const isValidBarcode = useCallback(
+    (value: string) => parseBarcode(value) !== null,
+    [],
+  );
+
+  const undoLast = useCallback(() => {
+    if (!scans.length) return;
+    const removed = scans[scans.length - 1];
+    setScans((items) => items.slice(0, -1));
+    setMessage(`Removed barcode ${removed.barcode}`);
+    setMessageType('ready');
+  }, [scans]);
+
   useEffect(() => {
-    if (mode !== '2') return;
+    if (mode !== '2' || cameraOpen) return;
     const onKeyDown = (event: KeyboardEvent) => {
       if (event.ctrlKey || event.metaKey || event.altKey) return;
       const target = event.target as HTMLElement;
@@ -120,7 +136,7 @@ export default function Home() {
       window.removeEventListener('keydown', onKeyDown);
       if (scannerTimer.current) clearTimeout(scannerTimer.current);
     };
-  }, [mode, addBarcode, autoEnter]);
+  }, [mode, cameraOpen, addBarcode, autoEnter]);
 
   const total = useMemo(
     () => scans.reduce((sum, scan) => sum + scan.weight, 0),
@@ -349,7 +365,10 @@ export default function Home() {
       <header className="sticky top-0 z-20 border-b border-[#e7d9cc] bg-[#fffdf9]/95 px-4 py-3 backdrop-blur sm:px-8">
         <div className="mx-auto flex max-w-[1500px] items-center justify-between gap-4">
           <button
-            onClick={() => setMode('home')}
+            onClick={() => {
+              setCameraOpen(false);
+              setMode('home');
+            }}
             className="inline-flex items-center gap-2 rounded-lg px-2 py-2 text-sm font-bold hover:bg-[#f1e7df]"
           >
             <ArrowLeft size={18} /> Barcode types
@@ -371,7 +390,8 @@ export default function Home() {
                   Scan barcodes
                 </h1>
                 <p className="mt-1 text-sm text-[#80675d]">
-                  Scan anywhere on this page, or enter / paste barcodes below.
+                  Scan with a scanner or phone camera, or enter / paste barcodes
+                  below.
                 </p>
               </div>
               <div className="flex flex-wrap items-center gap-2.5">
@@ -389,7 +409,7 @@ export default function Home() {
                 </label>
                 <button
                   disabled={!scans.length}
-                  onClick={() => setScans((items) => items.slice(0, -1))}
+                  onClick={undoLast}
                   className="inline-flex items-center gap-2 rounded-xl border border-[#dfd1c5] px-4 py-2 text-sm font-bold disabled:opacity-35"
                 >
                   <Undo2 size={16} /> Undo last
@@ -415,8 +435,21 @@ export default function Home() {
                 aria-label="Barcode input"
               />
               <button
+                type="button"
+                onClick={() => {
+                  unlockScanAudio();
+                  setCameraOpen(true);
+                }}
+                className="inline-flex shrink-0 items-center justify-center gap-2 rounded-xl border border-[#cfb9a9] bg-[#faf5f0] px-3.5 font-bold text-[#5a2417] transition hover:bg-[#f1e7df] active:scale-95"
+                aria-label="Scan barcode with camera"
+                title="Scan barcode with camera"
+              >
+                <Camera size={20} />
+                <span className="hidden sm:inline">Camera</span>
+              </button>
+              <button
                 type="submit"
-                className="rounded-xl bg-[#5a2417] px-5 font-bold text-white transition hover:bg-[#6c2a1b] active:scale-95"
+                className="shrink-0 rounded-xl bg-[#5a2417] px-4 font-bold text-white transition hover:bg-[#6c2a1b] active:scale-95 sm:px-5"
               >
                 Add
               </button>
@@ -585,6 +618,17 @@ export default function Home() {
           </section>
         </aside>
       </div>
+      <CameraScannerModal
+        open={cameraOpen}
+        onClose={() => setCameraOpen(false)}
+        onScan={addBarcode}
+        onUndo={undoLast}
+        isValidBarcode={isValidBarcode}
+        scanCount={scans.length}
+        totalWeight={total}
+        lastMessage={message}
+        lastMessageType={messageType}
+      />
     </main>
   );
 }

@@ -12,7 +12,8 @@
   "dependencies": {
     "lucide-react": "1.31.0",
     "react": "19.2.6",
-    "react-dom": "19.2.6"
+    "react-dom": "19.2.6",
+    "zxing-wasm": "^3.1.6"
   },
   "devDependencies": {
     "@tailwindcss/postcss": "4.2.1",
