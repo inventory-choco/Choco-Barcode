@@ -4,9 +4,8 @@ import {
   Check,
   Flashlight,
   FlashlightOff,
-  Plus,
   RefreshCw,
-  ShieldCheck,
+  ScanBarcode,
   SwitchCamera,
   Undo2,
   Volume2,
@@ -43,6 +42,8 @@ const BARCODE_READER_OPTIONS: ReaderOptions = {
   maxNumberOfSymbols: 4,
   eanAddOnSymbol: 'Ignore',
 };
+
+const SCAN_TIMEOUT_MS = 6000;
 
 let zxingPrepared = false;
 
@@ -203,7 +204,6 @@ type CameraScannerModalProps = {
   onScan: (barcode: string) => boolean;
   onUndo: () => void;
   isValidBarcode: (barcode: string) => boolean;
-  scannedBarcodes: Set<string>;
   scanCount: number;
   totalWeight: number;
   lastMessage: string;
@@ -216,7 +216,6 @@ export function CameraScannerModal({
   onScan,
   onUndo,
   isValidBarcode,
-  scannedBarcodes,
   scanCount,
   totalWeight,
   lastMessage,
@@ -225,10 +224,9 @@ export function CameraScannerModal({
   const [status, setStatus] = useState<'starting' | 'ready' | 'error'>(
     'starting',
   );
+  const [armed, setArmed] = useState(false);
   const [errorMsg, setErrorMsg] = useState('');
   const [hint, setHint] = useState('');
-  const [duplicateCandidate, setDuplicateCandidate] = useState('');
-  const [allowDuplicates, setAllowDuplicates] = useState(false);
   const [cameras, setCameras] = useState<MediaDeviceInfo[]>([]);
   const [selectedDeviceId, setSelectedDeviceId] = useState<string>('');
   const [torchSupported, setTorchSupported] = useState(false);
@@ -248,14 +246,14 @@ export function CameraScannerModal({
   const streamRef = useRef<MediaStream | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
   const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const timeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const flashTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const hintTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
-  const dupTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const armedRef = useRef(false);
+  const currentDeviceIdRef = useRef<string>('');
 
   const onScanRef = useRef(onScan);
   const isValidRef = useRef(isValidBarcode);
-  const scannedBarcodesRef = useRef(scannedBarcodes);
-  const allowDuplicatesRef = useRef(allowDuplicates);
   const soundEnabledRef = useRef(soundEnabled);
 
   useEffect(() => {
@@ -267,22 +265,19 @@ export function CameraScannerModal({
   }, [isValidBarcode]);
 
   useEffect(() => {
-    scannedBarcodesRef.current = scannedBarcodes;
-  }, [scannedBarcodes]);
-
-  useEffect(() => {
-    allowDuplicatesRef.current = allowDuplicates;
-  }, [allowDuplicates]);
-
-  useEffect(() => {
     soundEnabledRef.current = soundEnabled;
   }, [soundEnabled]);
 
-  const lastAcceptedAtRef = useRef<number>(0);
-  const lastAcceptedCodeRef = useRef<string>('');
-  const lastSeenByCodeRef = useRef<Map<string, number>>(new Map());
-  const lastAcceptedByCodeRef = useRef<Map<string, number>>(new Map());
-  const currentDeviceIdRef = useRef<string>('');
+  const stopScanTimers = useCallback(() => {
+    if (timerRef.current) {
+      clearTimeout(timerRef.current);
+      timerRef.current = null;
+    }
+    if (timeoutRef.current) {
+      clearTimeout(timeoutRef.current);
+      timeoutRef.current = null;
+    }
+  }, []);
 
   const triggerAcceptedFeedback = useCallback(() => {
     if (soundEnabledRef.current) {
@@ -299,10 +294,9 @@ export function CameraScannerModal({
   }, []);
 
   const stopCamera = useCallback(() => {
-    if (timerRef.current) {
-      clearTimeout(timerRef.current);
-      timerRef.current = null;
-    }
+    stopScanTimers();
+    armedRef.current = false;
+    setArmed(false);
     if (streamRef.current) {
       streamRef.current.getTracks().forEach((track) => track.stop());
       streamRef.current = null;
@@ -314,7 +308,7 @@ export function CameraScannerModal({
     setTorchSupported(false);
     setZoomRange(null);
     setZoomed(false);
-  }, []);
+  }, [stopScanTimers]);
 
   useEffect(() => {
     if (!open) return;
@@ -327,15 +321,12 @@ export function CameraScannerModal({
     return () => window.removeEventListener('keydown', onKeyDown);
   }, [open, onClose]);
 
+  // Manage live camera stream lifecycle
   useEffect(() => {
     if (!open) {
       stopCamera();
-      lastAcceptedAtRef.current = 0;
-      lastAcceptedCodeRef.current = '';
-      lastSeenByCodeRef.current.clear();
-      lastAcceptedByCodeRef.current.clear();
       setHint('');
-      setDuplicateCandidate('');
+      setScanFlash(false);
       return;
     }
 
@@ -383,128 +374,11 @@ export function CameraScannerModal({
       }
     };
 
-    const scanNextFrame = async () => {
-      if (cancelled) return;
-
-      const video = videoRef.current;
-      if (
-        video &&
-        video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
-        video.videoWidth > 0 &&
-        video.videoHeight > 0
-      ) {
-        // Strictly crop to the visible reticle box so moving past adjacent
-        // or previous barcodes outside the frame never triggers accidental scans.
-        const { sx, sy, sw, sh } = computeReticleCrop(
-          video,
-          reticleRef.current,
-        );
-
-        const maxDim = Math.max(sw, sh);
-        const scale = maxDim > 1280 ? 1280 / maxDim : 1;
-        const dw = Math.max(1, Math.round(sw * scale));
-        const dh = Math.max(1, Math.round(sh * scale));
-
-        if (!canvasRef.current) {
-          canvasRef.current = document.createElement('canvas');
-        }
-        const canvas = canvasRef.current;
-        if (canvas.width !== dw || canvas.height !== dh) {
-          canvas.width = dw;
-          canvas.height = dh;
-        }
-
-        const ctx = canvas.getContext('2d', { willReadFrequently: true });
-        if (ctx) {
-          ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
-          const imageData = ctx.getImageData(0, 0, dw, dh);
-          try {
-            const results = await readBarcodes(
-              imageData,
-              BARCODE_READER_OPTIONS,
-            );
-            if (cancelled) return;
-
-            if (results.length > 0) {
-              const validMatch = results.find(
-                (r) => r.isValid && isValidRef.current(r.text),
-              );
-
-              if (validMatch) {
-                const code = validMatch.text.trim();
-                const now = Date.now();
-                const sinceLastAccept = now - lastAcceptedAtRef.current;
-                const previousSeenForCode =
-                  lastSeenByCodeRef.current.get(code) ?? 0;
-                const previousAcceptForCode =
-                  lastAcceptedByCodeRef.current.get(code) ?? 0;
-                const gapSinceCodeSeen = now - previousSeenForCode;
-                const sinceCodeAccepted = now - previousAcceptForCode;
-
-                lastSeenByCodeRef.current.set(code, now);
-
-                if (
-                  !allowDuplicatesRef.current &&
-                  scannedBarcodesRef.current.has(code)
-                ) {
-                  // Prevent double-scanning an already-added barcode while moving.
-                  // Show a manual "+ Add again" pill only after 1.4s or if returning to an older code.
-                  if (
-                    code !== lastAcceptedCodeRef.current ||
-                    sinceLastAccept >= 1400
-                  ) {
-                    setDuplicateCandidate(code);
-                    if (dupTimerRef.current) clearTimeout(dupTimerRef.current);
-                    dupTimerRef.current = setTimeout(() => {
-                      setDuplicateCandidate('');
-                    }, 1500);
-                  }
-                } else {
-                  const shouldAccept = allowDuplicatesRef.current
-                    ? gapSinceCodeSeen >= 1500 &&
-                      sinceCodeAccepted >= 2500 &&
-                      sinceLastAccept >= 500
-                    : sinceLastAccept >= 450;
-
-                  if (shouldAccept) {
-                    lastAcceptedAtRef.current = now;
-                    lastAcceptedCodeRef.current = code;
-                    lastAcceptedByCodeRef.current.set(code, now);
-                    const added = onScanRef.current(code);
-                    if (added) {
-                      setHint('');
-                      setDuplicateCandidate('');
-                      triggerAcceptedFeedback();
-                    }
-                  }
-                }
-              } else {
-                const nonTwo = results.find((r) => r.isValid && r.text);
-                if (nonTwo) {
-                  setHint(
-                    `Detected ${nonTwo.text} — aim at the barcode starting with 2`,
-                  );
-                  if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
-                  hintTimerRef.current = setTimeout(() => setHint(''), 1800);
-                }
-              }
-            }
-          } catch {
-            // Skip malformed frame and continue scanning
-          }
-        }
-      }
-
-      if (!cancelled) {
-        timerRef.current = setTimeout(() => {
-          void scanNextFrame();
-        }, 100);
-      }
-    };
-
     const start = async () => {
       setStatus('starting');
       setErrorMsg('');
+      armedRef.current = false;
+      setArmed(false);
 
       if (!window.isSecureContext || !navigator.mediaDevices?.getUserMedia) {
         setErrorMsg(
@@ -583,9 +457,6 @@ export function CameraScannerModal({
         }
 
         setStatus('ready');
-        timerRef.current = setTimeout(() => {
-          void scanNextFrame();
-        }, 120);
       } catch (err) {
         if (!cancelled) {
           stopCamera();
@@ -611,16 +482,140 @@ export function CameraScannerModal({
       document.removeEventListener('visibilitychange', onVisibilityChange);
       if (flashTimerRef.current) clearTimeout(flashTimerRef.current);
       if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
-      if (dupTimerRef.current) clearTimeout(dupTimerRef.current);
       stopCamera();
     };
-  }, [
-    open,
-    selectedDeviceId,
-    restartToken,
-    stopCamera,
-    triggerAcceptedFeedback,
-  ]);
+  }, [open, selectedDeviceId, restartToken, stopCamera]);
+
+  // Run barcode detection only when the user taps Scan, stopping after 1 match
+  useEffect(() => {
+    if (!open || status !== 'ready' || !armed) {
+      stopScanTimers();
+      return;
+    }
+
+    let cancelled = false;
+
+    timeoutRef.current = setTimeout(() => {
+      if (cancelled || !armedRef.current) return;
+      armedRef.current = false;
+      setArmed(false);
+      stopScanTimers();
+      setHint('No 2-Barcode found — aim at the barcode and tap Scan');
+      if (hintTimerRef.current) clearTimeout(hintTimerRef.current);
+      hintTimerRef.current = setTimeout(() => setHint(''), 2500);
+    }, SCAN_TIMEOUT_MS);
+
+    const scanNextFrame = async () => {
+      if (cancelled || !armedRef.current) return;
+
+      const video = videoRef.current;
+      if (
+        video &&
+        video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
+        video.videoWidth > 0 &&
+        video.videoHeight > 0
+      ) {
+        const { sx, sy, sw, sh } = computeReticleCrop(
+          video,
+          reticleRef.current,
+        );
+
+        const maxDim = Math.max(sw, sh);
+        const scale = maxDim > 1280 ? 1280 / maxDim : 1;
+        const dw = Math.max(1, Math.round(sw * scale));
+        const dh = Math.max(1, Math.round(sh * scale));
+
+        if (!canvasRef.current) {
+          canvasRef.current = document.createElement('canvas');
+        }
+        const canvas = canvasRef.current;
+        if (canvas.width !== dw || canvas.height !== dh) {
+          canvas.width = dw;
+          canvas.height = dh;
+        }
+
+        const ctx = canvas.getContext('2d', { willReadFrequently: true });
+        if (ctx) {
+          ctx.drawImage(video, sx, sy, sw, sh, 0, 0, dw, dh);
+          const imageData = ctx.getImageData(0, 0, dw, dh);
+          try {
+            const results = await readBarcodes(
+              imageData,
+              BARCODE_READER_OPTIONS,
+            );
+            if (cancelled || !armedRef.current) return;
+
+            if (results.length > 0) {
+              const validMatch = results.find(
+                (r) => r.isValid && isValidRef.current(r.text),
+              );
+
+              if (validMatch) {
+                const code = validMatch.text.trim();
+                // Disarm immediately so exactly 1 barcode is added per Scan tap
+                armedRef.current = false;
+                stopScanTimers();
+                setArmed(false);
+
+                const added = onScanRef.current(code);
+                if (added) {
+                  setHint('');
+                  triggerAcceptedFeedback();
+                }
+                return;
+              }
+
+              const nonTwo = results.find((r) => r.isValid && r.text);
+              if (nonTwo) {
+                setHint(
+                  `Ignoring ${nonTwo.text} — aim at barcode starting with 2`,
+                );
+              }
+            }
+          } catch {
+            // Skip malformed frame and continue while armed
+          }
+        }
+      }
+
+      if (!cancelled && armedRef.current) {
+        timerRef.current = setTimeout(() => {
+          void scanNextFrame();
+        }, 80);
+      }
+    };
+
+    void scanNextFrame();
+
+    return () => {
+      cancelled = true;
+      stopScanTimers();
+    };
+  }, [open, status, armed, stopScanTimers, triggerAcceptedFeedback]);
+
+  const startScan = () => {
+    if (status !== 'ready') return;
+    unlockScanAudio();
+    if (flashTimerRef.current) {
+      clearTimeout(flashTimerRef.current);
+      flashTimerRef.current = null;
+    }
+    if (hintTimerRef.current) {
+      clearTimeout(hintTimerRef.current);
+      hintTimerRef.current = null;
+    }
+    setScanFlash(false);
+    setHint('');
+    armedRef.current = true;
+    setArmed(true);
+  };
+
+  const cancelScan = () => {
+    armedRef.current = false;
+    stopScanTimers();
+    setArmed(false);
+    setHint('');
+  };
 
   const toggleTorch = async () => {
     const track = streamRef.current?.getVideoTracks()[0];
@@ -662,28 +657,6 @@ export function CameraScannerModal({
     setSelectedDeviceId(cameras[nextIndex].deviceId);
   };
 
-  const addDuplicateManually = () => {
-    if (!duplicateCandidate) return;
-    const code = duplicateCandidate;
-    const added = onScanRef.current(code);
-    if (added) {
-      const now = Date.now();
-      lastAcceptedAtRef.current = now;
-      lastAcceptedCodeRef.current = code;
-      lastAcceptedByCodeRef.current.set(code, now);
-      setDuplicateCandidate('');
-      setHint('');
-      triggerAcceptedFeedback();
-    }
-  };
-
-  const handleUndo = () => {
-    // Brief pause so the just-undone barcode isn't immediately re-scanned
-    lastAcceptedAtRef.current = Date.now() + 900;
-    setDuplicateCandidate('');
-    onUndo();
-  };
-
   if (!open) return null;
 
   return (
@@ -703,7 +676,7 @@ export function CameraScannerModal({
             <div>
               <p className="text-sm font-black leading-tight">Camera scanner</p>
               <p className="text-[11px] font-medium text-[#cfb3a5]">
-                Aim inside box · 2-Barcode
+                Aim at barcode &amp; tap Scan
               </p>
             </div>
           </div>
@@ -796,9 +769,9 @@ export function CameraScannerModal({
                 className={`relative h-36 w-full max-w-[320px] rounded-2xl border-2 transition-colors duration-200 ${
                   scanFlash
                     ? 'border-[#4ade80] bg-[#4ade80]/15 shadow-[0_0_0_9999px_rgba(0,0,0,0.45)]'
-                    : duplicateCandidate
-                      ? 'border-[#fbbf24] shadow-[0_0_0_9999px_rgba(0,0,0,0.58)]'
-                      : 'border-white/80 shadow-[0_0_0_9999px_rgba(0,0,0,0.58)]'
+                    : armed
+                      ? 'border-[#f2a679] bg-white/5 shadow-[0_0_0_9999px_rgba(0,0,0,0.52)]'
+                      : 'border-white/70 shadow-[0_0_0_9999px_rgba(0,0,0,0.58)]'
                 }`}
               >
                 <span className="absolute -top-0.5 -left-0.5 h-6 w-6 rounded-tl-2xl border-t-4 border-l-4 border-[#f2a679]" />
@@ -806,32 +779,22 @@ export function CameraScannerModal({
                 <span className="absolute -bottom-0.5 -left-0.5 h-6 w-6 rounded-bl-2xl border-b-4 border-l-4 border-[#f2a679]" />
                 <span className="absolute -right-0.5 -bottom-0.5 h-6 w-6 rounded-br-2xl border-r-4 border-b-4 border-[#f2a679]" />
                 <div
-                  className={`absolute inset-x-4 top-1/2 h-0.5 -translate-y-1/2 rounded-full transition-colors ${
+                  className={`absolute inset-x-4 top-1/2 h-0.5 -translate-y-1/2 rounded-full transition-all ${
                     scanFlash
                       ? 'bg-[#4ade80] shadow-[0_0_12px_#4ade80]'
-                      : duplicateCandidate
-                        ? 'bg-[#fbbf24] shadow-[0_0_8px_#fbbf24]'
-                        : 'bg-[#f87171]/80 shadow-[0_0_8px_#f87171]'
+                      : armed
+                        ? 'animate-pulse bg-[#f87171] shadow-[0_0_10px_#f87171]'
+                        : 'bg-white/35'
                   }`}
                 />
               </div>
 
-              {duplicateCandidate ? (
-                <div className="pointer-events-auto mt-4 flex items-center gap-2 rounded-full border border-[#fbbf24]/50 bg-[#23110b]/95 py-1 pr-1.5 pl-3.5 text-xs font-bold text-[#fde68a] shadow-lg backdrop-blur-xs">
-                  <span>Already scanned</span>
-                  <button
-                    type="button"
-                    onClick={addDuplicateManually}
-                    className="inline-flex items-center gap-1 rounded-full bg-[#fbbf24] px-2.5 py-1 text-xs font-black text-[#29150f] transition active:scale-95"
-                  >
-                    <Plus size={13} /> Add again
-                  </button>
-                </div>
-              ) : (
-                <p className="mt-4 rounded-full bg-black/70 px-3.5 py-1.5 text-center text-xs font-semibold text-white/90 backdrop-blur-xs">
-                  {hint || 'Place barcode inside the box · 10–20 cm away'}
-                </p>
-              )}
+              <p className="mt-4 rounded-full bg-black/75 px-3.5 py-1.5 text-center text-xs font-semibold text-white/95 backdrop-blur-xs">
+                {hint ||
+                  (armed
+                    ? 'Scanning… hold steady on barcode'
+                    : 'Point box at barcode, then tap Scan')}
+              </p>
             </div>
           )}
 
@@ -863,31 +826,8 @@ export function CameraScannerModal({
         </div>
 
         {/* Bottom feedback & controls */}
-        <div className="border-t border-white/10 bg-[#23110b] px-4 pt-3 pb-[calc(1rem+env(safe-area-inset-bottom))]">
-          <div className="mb-2.5 flex items-center justify-between gap-2">
-            <button
-              type="button"
-              onClick={() => {
-                setAllowDuplicates((prev) => !prev);
-                setDuplicateCandidate('');
-              }}
-              className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-[11px] font-bold transition ${
-                !allowDuplicates
-                  ? 'border-[#34d399]/35 bg-[#064e3b]/60 text-[#6ee7b7]'
-                  : 'border-white/15 bg-white/10 text-[#f5d5c3]'
-              }`}
-              title="Toggle whether the same barcode can be scanned repeatedly without tapping Add again"
-            >
-              <ShieldCheck size={13} />
-              <span>
-                {!allowDuplicates
-                  ? 'Skip duplicates: ON'
-                  : 'Allow duplicates: ON'}
-              </span>
-            </button>
-          </div>
-
-          <div className="flex items-center justify-between gap-3">
+        <div className="border-t border-white/10 bg-[#23110b] px-4 pt-3.5 pb-[calc(1rem+env(safe-area-inset-bottom))]">
+          <div className="mb-3 flex items-center justify-between gap-3">
             <div className="min-w-0 flex-1">
               <p
                 role="status"
@@ -910,25 +850,39 @@ export function CameraScannerModal({
               </p>
             </div>
 
-            <div className="flex shrink-0 items-center gap-2">
-              <button
-                type="button"
-                disabled={scanCount === 0}
-                onClick={handleUndo}
-                className="inline-flex items-center gap-1.5 rounded-xl border border-white/15 bg-white/10 px-3 py-2.5 text-xs font-bold text-white transition hover:bg-white/20 disabled:opacity-35"
-                title="Undo last scanned barcode"
-              >
-                <Undo2 size={15} />
-                <span>Undo</span>
-              </button>
-              <button
-                type="button"
-                onClick={onClose}
-                className="rounded-xl bg-white px-4 py-2.5 text-sm font-black text-[#29150f] transition hover:bg-[#f5ede6] active:scale-95"
-              >
-                Done
-              </button>
-            </div>
+            <button
+              type="button"
+              disabled={scanCount === 0}
+              onClick={onUndo}
+              className="inline-flex shrink-0 items-center gap-1.5 rounded-xl border border-white/15 bg-white/10 px-3 py-2 text-xs font-bold text-white transition hover:bg-white/20 disabled:opacity-35"
+              title="Undo last scanned barcode"
+            >
+              <Undo2 size={15} />
+              <span>Undo</span>
+            </button>
+          </div>
+
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              disabled={status !== 'ready'}
+              onClick={armed ? cancelScan : startScan}
+              className={`flex flex-1 items-center justify-center gap-2 rounded-2xl px-5 py-3.5 text-base font-black transition active:scale-[0.98] disabled:opacity-40 ${
+                armed
+                  ? 'border border-[#f2a679] bg-[#5a2417] text-white'
+                  : 'bg-[#f2a679] text-[#29150f] shadow-lg hover:bg-[#f6b893]'
+              }`}
+            >
+              <ScanBarcode size={20} />
+              <span>{armed ? 'Scanning… (Tap to stop)' : 'Scan'}</span>
+            </button>
+            <button
+              type="button"
+              onClick={onClose}
+              className="shrink-0 rounded-2xl bg-white px-5 py-3.5 text-base font-black text-[#29150f] transition hover:bg-[#f5ede6] active:scale-[0.98]"
+            >
+              Done
+            </button>
           </div>
         </div>
       </div>
